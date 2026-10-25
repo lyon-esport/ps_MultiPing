@@ -1,2 +1,2 @@
 # ps_MultiPing
-Multi ping tool in PowerShell
+Multi ping tool vibecoded in PowerShell
