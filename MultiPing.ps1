@@ -42,6 +42,8 @@ Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 $script:HostsFile   = Join-Path $PSScriptRoot 'hosts.csv'
+$script:ActiveHostsFile = $script:HostsFile
+$script:LoadingTargets = $false
 $script:LegacyFile  = Join-Path $PSScriptRoot 'hosts.txt'
 $script:Targets     = New-Object System.Collections.ArrayList
 $script:Running     = $false
@@ -128,11 +130,42 @@ function Read-TargetCsv([string]$path) {
     }
 }
 
-function Import-TargetCsv([string]$path) {
+function Import-TargetCsv([string]$path, [switch]$Merge) {
     try {
-        foreach ($r in Read-TargetCsv $path) { Add-Target $r.IP $r.Name }
+        $rows = @(Read-TargetCsv $path)
+        $script:ActiveHostsFile = [System.IO.Path]::GetFullPath($path)
+        $script:LoadingTargets = $true
+        if (-not $Merge) {
+            foreach ($t in $script:Targets) {
+                try { $t.Ping.Dispose() } catch { }
+            }
+            $script:Targets.Clear()
+            $grid.Rows.Clear()
+            $script:LastSelected = $null
+            $script:NextOrder = 0
+        }
+        foreach ($r in $rows) { Add-Target $r.IP $r.Name }
+        [void](Save-HostsCsv)
     } catch {
         [void][System.Windows.Forms.MessageBox]::Show("Cannot read CSV '$path':`n$($_.Exception.Message)", 'PS MultiPing', 'OK', 'Error')
+    } finally {
+        $script:LoadingTargets = $false
+    }
+}
+
+function Save-HostsCsv {
+    $tempPath = "$($script:ActiveHostsFile).$([guid]::NewGuid().ToString('N')).tmp"
+    try {
+        $directory = [System.IO.Path]::GetDirectoryName($script:ActiveHostsFile)
+        if (-not (Test-Path -LiteralPath $directory)) { [void](New-Item -ItemType Directory -Path $directory -Force) }
+        $script:Targets | ForEach-Object { [pscustomobject]@{ IP = $_.Name; Name = $_.Device } } |
+            Export-Csv -LiteralPath $tempPath -NoTypeInformation -Encoding UTF8
+        Move-Item -LiteralPath $tempPath -Destination $script:ActiveHostsFile -Force
+        return $true
+    } catch {
+        Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+        [void][System.Windows.Forms.MessageBox]::Show("Cannot update host CSV '$script:ActiveHostsFile':`n$($_.Exception.Message)", 'PS MultiPing', 'OK', 'Error')
+        return $false
     }
 }
 
@@ -157,6 +190,7 @@ function Add-Target([string]$name, [string]$device = '') {
     [void]$script:Targets.Add($t)
     Update-Row $t
     $script:ViewDirty = $true
+    if (-not $script:LoadingTargets) { [void](Save-HostsCsv) }
 }
 
 function Set-TargetHost($t, [string]$name) {
@@ -321,7 +355,8 @@ function Show-OptionsDialog {
 }
 
 function Get-SelectedTarget {
-    if ($grid.SelectedRows.Count) { $grid.SelectedRows[0].Tag }
+    if ($grid.SelectedRows.Count) { return $grid.SelectedRows[0].Tag }
+    if ($grid.SelectedCells.Count) { return $grid.SelectedCells[0].OwningRow.Tag }
 }
 
 # Fixed-width hex of the address bytes sorts each octet numerically (10.0.0.9 < 10.0.0.10).
@@ -420,9 +455,10 @@ $grid = New-Object System.Windows.Forms.DataGridView
 $grid.Dock = 'Fill'
 $grid.AllowUserToAddRows = $false
 $grid.AllowUserToDeleteRows = $false
-$grid.RowHeadersVisible = $false
-$grid.SelectionMode = 'FullRowSelect'
+$grid.RowHeadersVisible = $true
+$grid.SelectionMode = 'RowHeaderSelect'
 $grid.MultiSelect = $false
+$grid.ClipboardCopyMode = 'EnableWithoutHeaderText'
 $grid.AutoSizeColumnsMode = 'Fill'
 $grid.BackgroundColor = [System.Drawing.Color]::White
 foreach ($col in @('Device','Host','Address','Status','Last','Avg','Min','Max','Sent','Recv','Loss')) {
@@ -486,6 +522,7 @@ $btnDel.Add_Click({
     if ($t) {
         $grid.Rows.Remove($t.Row)
         [void]$script:Targets.Remove($t)
+        [void](Save-HostsCsv)
         $script:ViewDirty = $true
         $graph.Invalidate()
     }
@@ -505,7 +542,18 @@ $btnReset.Add_Click({ foreach ($t in $script:Targets) { Reset-Stats $t }; $graph
 $btnCsv.Add_Click({
     $dlg = New-Object System.Windows.Forms.OpenFileDialog
     $dlg.Filter = 'CSV files (*.csv)|*.csv|All files (*.*)|*.*'
-    if ($dlg.ShowDialog($form) -eq 'OK') { Import-TargetCsv $dlg.FileName }
+    if ($dlg.ShowDialog($form) -eq 'OK') {
+        $merge = $false
+        if ($script:Targets.Count) {
+            $choice = [System.Windows.Forms.MessageBox]::Show(
+                "Merge the imported devices into the current list?`n`nYes: merge`nNo: replace the current list`nCancel: do nothing",
+                'Import devices', 'YesNoCancel', 'Question', 'Button2'
+            )
+            if ($choice -eq 'Cancel') { $dlg.Dispose(); return }
+            $merge = $choice -eq 'Yes'
+        }
+        Import-TargetCsv $dlg.FileName -Merge:$merge
+    }
     $dlg.Dispose()
 })
 
@@ -532,6 +580,7 @@ $grid.Add_CellEndEdit({
     if ($col -eq 'Device' -and $v -ne $t.Device) {
         Write-Log "EDIT  $($t.Name)  device '$($t.Device)' -> '$v'"
         $t.Device = $v
+        [void](Save-HostsCsv)
     } elseif ($col -eq 'Host' -and $v -ne $t.Name) {
         $err = if (-not $v) { 'Host / IP cannot be empty.' }
                elseif ([System.Uri]::CheckHostName($v) -eq 'Unknown') { "'$v' is not a valid IP address or host name." }
@@ -543,6 +592,7 @@ $grid.Add_CellEndEdit({
         }
         Write-Log "EDIT  $($t.Name) -> $v$(if ($t.Device) { "  ($($t.Device))" })  (stats reset)"
         Set-TargetHost $t $v
+        [void](Save-HostsCsv)
     }
     Update-Row $t
     $script:ViewDirty = $true
@@ -715,8 +765,7 @@ $form.Add_Shown({
 $form.Add_FormClosing({
     $timer.Stop()
     Write-Log '----  Application closed'
-    $script:Targets | ForEach-Object { [pscustomobject]@{ IP = $_.Name; Name = $_.Device } } |
-        Export-Csv -Path $script:HostsFile -NoTypeInformation -Encoding UTF8
+    [void](Save-HostsCsv)
 })
 #endregion
 
